@@ -278,6 +278,7 @@ async function startServer() {
     const chatLimiter = new SlidingWindowLimiter(10, 10_000);
     const clipLimiter = new SlidingWindowLimiter(8, 15_000);
     const frameLimiter = new SlidingWindowLimiter(15, 1_000);
+    const audioLimiter = new SlidingWindowLimiter(25, 1_000);
 
     ws.on('message', (raw) => {
       ws.isAlive = true;
@@ -565,6 +566,31 @@ async function startServer() {
             },
             participantId
           );
+        } else if (msg.type === 'media:audio') {
+          const entry = currentRoom.participants.get(participantId);
+          if (!entry || entry.info.role === 'viewer' || !entry.info.audioEnabled) return;
+          if (!audioLimiter.allow()) return;
+          const pcm16 = typeof msg.pcm16 === 'string' ? msg.pcm16 : '';
+          const sampleRate = Number(msg.sampleRate);
+          if (
+            !pcm16 ||
+            pcm16.length > 48_000 ||
+            !Number.isFinite(sampleRate) ||
+            sampleRate < 8000 ||
+            sampleRate > 48000
+          ) {
+            return;
+          }
+          broadcastToRoom(
+            currentRoom,
+            {
+              type: 'media:audio',
+              fromId: participantId,
+              pcm16,
+              sampleRate: Math.round(sampleRate),
+            },
+            participantId
+          );
         }
       } catch {
         // Ignore malformed socket frames
@@ -583,6 +609,18 @@ async function startServer() {
             type: 'participant:left',
             participantId,
           });
+          const remainingBroadcasters = Array.from(currentRoom.participants.values()).filter(
+            (p) => p.info.role !== 'viewer'
+          );
+          if (currentRoom.isLive && remainingBroadcasters.length === 0) {
+            currentRoom.isLive = false;
+            currentRoom.streamStartedAt = null;
+            broadcastToRoom(currentRoom, {
+              type: 'stream:status',
+              isLive: false,
+              streamStartedAt: null,
+            });
+          }
         }
       }
     });

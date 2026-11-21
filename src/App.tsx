@@ -12,6 +12,31 @@ function getInitialRoomFromUrl(): string {
   return room ? sanitizeRoomSlug(room) : 'main-stage';
 }
 
+async function copyTextReliable(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below for iframe / non-HTTPS clipboard permissions
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const studio = useStudioRoom(getInitialRoomFromUrl());
   const [showRoomSwitcher, setShowRoomSwitcher] = useState(false);
@@ -19,12 +44,10 @@ export default function App() {
 
   const handleCopyInvite = async () => {
     const url = `${window.location.origin}/?room=${encodeURIComponent(studio.roomId)}`;
-    try {
-      await navigator.clipboard.writeText(url);
+    const ok = await copyTextReliable(url);
+    if (ok) {
       setCopiedInvite(true);
       window.setTimeout(() => setCopiedInvite(false), 2000);
-    } catch {
-      // Clipboard blocked in non-HTTPS context
     }
   };
 
@@ -58,6 +81,10 @@ export default function App() {
         onCopyInvite={handleCopyInvite}
         onToggleRoomSwitcher={() => setShowRoomSwitcher((v) => !v)}
         onToggleLive={studio.toggleGoLive}
+        onLeaveRoom={() => {
+          setShowRoomSwitcher(false);
+          studio.leaveRoom();
+        }}
         onSwitchToStageRole={() => {
           void studio.joinRoom(studio.roomId, {
             name: studio.selfName,
@@ -77,6 +104,10 @@ export default function App() {
           streamStartedAt={studio.streamStartedAt}
           isAutoRecording={studio.isAutoRecording}
           lastClipMarker={studio.lastClipMarker}
+          streamEndedNotice={studio.streamEndedNotice}
+          audioBlocked={studio.audioBlocked}
+          audioUnlockSeq={studio.audioUnlockSeq}
+          mutedPeerIds={studio.mutedPeerIds}
           selfId={studio.selfId}
           selfName={studio.selfName}
           selfRole={studio.selfRole}
@@ -97,11 +128,19 @@ export default function App() {
           showRoomSwitcher={showRoomSwitcher}
           onCloseRoomSwitcher={() => setShowRoomSwitcher(false)}
           onJoinRoom={studio.joinRoom}
+          onLeaveRoom={() => {
+            setShowRoomSwitcher(false);
+            studio.leaveRoom();
+          }}
+          onDismissStreamEndedNotice={studio.dismissStreamEndedNotice}
           onUpdateRoomMeta={studio.updateRoomMeta}
           onSwitchInputDevice={studio.switchInputDevice}
           onToggleAudio={studio.toggleAudio}
           onToggleVideo={studio.toggleVideo}
           onToggleScreenShare={studio.toggleScreenShare}
+          onTogglePeerMute={studio.togglePeerMute}
+          onUnlockAudio={studio.unlockAudio}
+          onReportAudioBlocked={studio.reportAudioBlocked}
           onTriggerClipMark={studio.triggerClipMark}
         />
 

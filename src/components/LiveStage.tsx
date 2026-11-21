@@ -10,6 +10,7 @@ import {
   VideoOff,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import {
   formatClockDuration,
@@ -32,12 +33,25 @@ interface VideoTileProps {
   stream: MediaStream | null;
   relayFrame?: string;
   isSelf: boolean;
+  isPeerMuted: boolean;
+  audioUnlockSeq: number;
+  onTogglePeerMute: () => void;
+  onAudioBlocked: () => void;
 }
 
-function ParticipantVideoTile({ participant, stream, relayFrame, isSelf }: VideoTileProps) {
+function ParticipantVideoTile({
+  participant,
+  stream,
+  relayFrame,
+  isSelf,
+  isPeerMuted,
+  audioUnlockSeq,
+  onTogglePeerMute,
+  onAudioBlocked,
+}: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const [imgFailed, setImgFailed] = useState(false);
-  const [remoteMuted, setRemoteMuted] = useState(false);
   const [hasLiveVideoFrame, setHasLiveVideoFrame] = useState(false);
 
   const isVideoActive = participant.videoEnabled || participant.screenSharing;
@@ -46,27 +60,41 @@ function ParticipantVideoTile({ participant, stream, relayFrame, isSelf }: Video
     setHasLiveVideoFrame(false);
   }, [stream, isVideoActive]);
 
+  // Video element (always muted; remote audio plays through the dedicated <audio> element below
+  // so turning a friend's camera off NEVER cuts off their microphone audio!)
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
     if (stream && isVideoActive) {
       el.srcObject = stream;
-      el.muted = isSelf || remoteMuted;
+      el.muted = true;
       if (el.readyState >= 2 && el.videoWidth > 0) {
         setHasLiveVideoFrame(true);
       }
-      el.play().catch(() => {
-        if (!isSelf && !el.muted) {
-          el.muted = true;
-          setRemoteMuted(true);
-          el.play().catch(() => {});
-        }
-      });
+      el.play().catch(() => {});
     } else {
       el.srcObject = null;
       setHasLiveVideoFrame(false);
     }
-  }, [stream, isVideoActive, isSelf, remoteMuted]);
+  }, [stream, isVideoActive]);
+
+  // Dedicated always-mounted remote audio playback element (independent of camera on/off)
+  useEffect(() => {
+    const audioEl = audioRef.current;
+    if (!audioEl || isSelf) return;
+    if (stream) {
+      audioEl.srcObject = stream;
+      audioEl.muted = isPeerMuted;
+      audioEl.volume = 1;
+      if (!isPeerMuted) {
+        audioEl.play().catch(() => {
+          onAudioBlocked();
+        });
+      }
+    } else {
+      audioEl.srcObject = null;
+    }
+  }, [stream, isSelf, isPeerMuted, audioUnlockSeq, onAudioBlocked]);
 
   const fallbackAvatar =
     participant.avatarUrl || getFallbackAnimalAvatar(participant.id).url;
@@ -78,12 +106,17 @@ function ParticipantVideoTile({ participant, stream, relayFrame, isSelf }: Video
       data-testid={`video-tile-${participant.id}`}
       className="relative aspect-video rounded-2xl overflow-hidden bg-slate-100 border border-slate-200/90 shadow-xs"
     >
+      {/* Always-mounted hidden audio element for remote participants */}
+      {!isSelf && stream && (
+        <audio ref={audioRef} autoPlay playsInline muted={isPeerMuted} className="hidden" />
+      )}
+
       {stream && isVideoActive && (
         <video
           ref={videoRef}
           autoPlay
           playsInline
-          muted={isSelf || remoteMuted}
+          muted
           onLoadedData={() => {
             if (videoRef.current && videoRef.current.videoWidth > 0) {
               setHasLiveVideoFrame(true);
@@ -124,21 +157,16 @@ function ParticipantVideoTile({ participant, stream, relayFrame, isSelf }: Video
         </div>
       ) : null}
 
-      {!isSelf && (stream || relayFrame) && (
+      {/* Per-participant speaker mute button (always available for remote peers, even with camera off) */}
+      {!isSelf && (
         <button
           type="button"
-          onClick={() => {
-            const nextMuted = !remoteMuted;
-            setRemoteMuted(nextMuted);
-            if (videoRef.current) {
-              videoRef.current.muted = nextMuted;
-              videoRef.current.play().catch(() => {});
-            }
-          }}
-          aria-label={remoteMuted ? `Unmute ${participant.name}` : `Mute ${participant.name}`}
+          onClick={onTogglePeerMute}
+          aria-pressed={isPeerMuted}
+          aria-label={isPeerMuted ? `Unmute ${participant.name}` : `Mute ${participant.name}`}
           className="absolute top-3 right-3 p-2 rounded-xl bg-white/90 hover:bg-white text-slate-900 border border-slate-200/80 shadow-xs backdrop-blur-sm transition-colors"
         >
-          {remoteMuted ? (
+          {isPeerMuted ? (
             <VolumeX className="w-3.5 h-3.5 text-rose-600" aria-hidden="true" />
           ) : (
             <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
@@ -174,6 +202,10 @@ interface LiveStageProps {
   streamStartedAt: number | null;
   isAutoRecording: boolean;
   lastClipMarker: ClipMarkerEvent | null;
+  streamEndedNotice: string | null;
+  audioBlocked: boolean;
+  audioUnlockSeq: number;
+  mutedPeerIds: Record<string, boolean>;
   selfId: string | null;
   selfName: string;
   selfRole: ParticipantRole;
@@ -198,11 +230,16 @@ interface LiveStageProps {
     profile: StudioProfile,
     meta?: { title?: string; category?: StreamCategory }
   ) => void;
+  onLeaveRoom: () => void;
+  onDismissStreamEndedNotice: () => void;
   onUpdateRoomMeta: (meta: { title?: string; category?: StreamCategory }) => void;
   onSwitchInputDevice: (audioId: string, videoId: string) => void;
   onToggleAudio: () => void;
   onToggleVideo: () => void;
   onToggleScreenShare: () => void;
+  onTogglePeerMute: (peerId: string) => void;
+  onUnlockAudio: () => void;
+  onReportAudioBlocked: () => void;
   onTriggerClipMark: (source?: 'manual' | 'voice') => void;
 }
 
@@ -214,6 +251,10 @@ export function LiveStage({
   streamStartedAt,
   isAutoRecording,
   lastClipMarker,
+  streamEndedNotice,
+  audioBlocked,
+  audioUnlockSeq,
+  mutedPeerIds,
   selfId,
   selfName,
   selfRole,
@@ -234,11 +275,16 @@ export function LiveStage({
   showRoomSwitcher,
   onCloseRoomSwitcher,
   onJoinRoom,
+  onLeaveRoom,
+  onDismissStreamEndedNotice,
   onUpdateRoomMeta,
   onSwitchInputDevice,
   onToggleAudio,
   onToggleVideo,
   onToggleScreenShare,
+  onTogglePeerMute,
+  onUnlockAudio,
+  onReportAudioBlocked,
   onTriggerClipMark,
 }: LiveStageProps) {
   const [editingMeta, setEditingMeta] = useState(false);
@@ -248,7 +294,7 @@ export function LiveStage({
   const [nameInput, setNameInput] = useState(selfName);
   const [nameError, setNameError] = useState<string | null>(null);
   const [roomInput, setRoomInput] = useState(roomId);
-  const [roleInput, setRoleInput] = useState<ParticipantRole>('cohost');
+  const [roleInput, setRoleInput] = useState<ParticipantRole>(selfRole);
   const [liveClockSec, setLiveClockSec] = useState(0);
 
   useEffect(() => {
@@ -259,6 +305,10 @@ export function LiveStage({
   useEffect(() => {
     setNameInput(selfName);
   }, [selfName]);
+
+  useEffect(() => {
+    setRoleInput(selfRole);
+  }, [selfRole]);
 
   useEffect(() => {
     setRoomInput(roomId);
@@ -427,13 +477,18 @@ export function LiveStage({
                 <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
               </button>
             )}
-            {isLive && (
+            {isLive ? (
               <span className="inline-flex items-center gap-2 text-xs font-mono font-semibold text-rose-600 tabular-nums">
                 <span className="w-2 h-2 rounded-full bg-rose-600 animate-pulse" aria-hidden="true" />
                 LIVE · {formatClockDuration(liveClockSec)}
                 {isAutoRecording && (
                   <span className="text-slate-500 font-normal">· Auto-buffering</span>
                 )}
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 text-xs font-mono text-slate-400">
+                <span className="w-2 h-2 rounded-full bg-slate-300" aria-hidden="true" />
+                OFFLINE
               </span>
             )}
           </div>
@@ -480,13 +535,70 @@ export function LiveStage({
               ))}
             </select>
           </div>
-          <button
-            type="submit"
-            className="px-4 py-1.5 text-xs font-semibold bg-slate-950 hover:bg-slate-800 text-white rounded-xl transition-colors"
-          >
-            Save
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              className="px-4 py-1.5 text-xs font-semibold bg-slate-950 hover:bg-slate-800 text-white rounded-xl transition-colors"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditingMeta(false)}
+              className="px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
         </form>
+      )}
+
+      {/* Browser Autoplay Unlock Prompt */}
+      {audioBlocked && (
+        <div
+          role="alert"
+          className="mx-5 md:mx-7 mb-4 px-4 py-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 flex flex-wrap items-center justify-between gap-2 text-xs"
+        >
+          <span className="inline-flex items-center gap-2 font-medium">
+            <VolumeX className="w-4 h-4 text-rose-600" aria-hidden="true" />
+            <span>Your browser paused remote audio until you interact with the page.</span>
+          </span>
+          <button
+            type="button"
+            onClick={onUnlockAudio}
+            className="px-3 py-1.5 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition-colors whitespace-nowrap"
+          >
+            Enable Stream Audio
+          </button>
+        </div>
+      )}
+
+      {/* End Stream Confirmation Banner */}
+      {streamEndedNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mx-5 md:mx-7 mb-4 px-4 py-2.5 rounded-xl bg-white border border-slate-200 text-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs shadow-xs"
+        >
+          <span className="font-medium">{streamEndedNotice}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onLeaveRoom}
+              className="px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 rounded-lg transition-colors"
+            >
+              Leave Room
+            </button>
+            <button
+              type="button"
+              onClick={onDismissStreamEndedNotice}
+              aria-label="Dismiss stream ended notice"
+              className="p-1 text-slate-400 hover:text-slate-900 rounded"
+            >
+              <X className="w-3.5 h-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Momentary Clip Marker Confirmation */}
@@ -526,7 +638,7 @@ export function LiveStage({
               <div className="relative aspect-video rounded-2xl overflow-hidden bg-white border border-slate-200/90 shadow-xs flex items-center justify-center p-8 text-center">
                 <div className="max-w-sm space-y-1.5">
                   <p className="font-display text-lg font-semibold text-slate-900">
-                    {selfRole === 'viewer' ? 'Waiting for the stream' : 'Preparing your stage'}
+                    {selfRole === 'viewer' ? 'Stream is offline' : 'Preparing your stage'}
                   </p>
                   <p className="text-sm text-slate-500">
                     {selfRole === 'viewer'
@@ -547,6 +659,10 @@ export function LiveStage({
                     stream={stream}
                     relayFrame={relayFrame}
                     isSelf={isSelf}
+                    isPeerMuted={Boolean(mutedPeerIds[p.id])}
+                    audioUnlockSeq={audioUnlockSeq}
+                    onTogglePeerMute={() => onTogglePeerMute(p.id)}
+                    onAudioBlocked={onReportAudioBlocked}
                   />
                 );
               })
@@ -694,7 +810,9 @@ export function LiveStage({
         ) : (
           <div className="max-w-4xl mx-auto w-full bg-white border border-slate-200/90 rounded-2xl px-4 py-3 shadow-xs flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-slate-600">
-              Watching as a viewer. Chat live on the right or step onto the stage anytime.
+              {isLive
+                ? 'Watching live. Chat on the right or step onto the stage anytime.'
+                : 'Stream is currently offline. Chat live or step onto the stage.'}
             </p>
             <button
               type="button"

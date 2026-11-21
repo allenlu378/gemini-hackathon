@@ -1,4 +1,4 @@
-import { Check } from 'lucide-react';
+import { Check, LogOut } from 'lucide-react';
 import type { ParticipantRole } from '../utils/types';
 
 interface TopNavProps {
@@ -10,6 +10,7 @@ interface TopNavProps {
   onToggleRoomSwitcher: () => void;
   onToggleLive: () => void;
   onSwitchToStageRole: () => void;
+  onLeaveRoom: () => void;
 }
 
 export function TopNav({
@@ -21,6 +22,7 @@ export function TopNav({
   onToggleRoomSwitcher,
   onToggleLive,
   onSwitchToStageRole,
+  onLeaveRoom,
 }: TopNavProps) {
   return (
     <header className="h-14 md:h-16 shrink-0 bg-white border-b border-slate-200/80 px-3.5 md:px-6 flex items-center justify-between gap-3 md:gap-8">
@@ -29,7 +31,7 @@ export function TopNav({
         ClipThat
       </span>
 
-      {/* Zone 2: Clean single-line room actions (no page tabs) */}
+      {/* Zone 2: Clean single-line room actions */}
       <nav aria-label="Studio actions" className="flex items-center gap-3.5 sm:gap-6 md:gap-7">
         <button
           type="button"
@@ -49,6 +51,16 @@ export function TopNav({
           }`}
         >
           {showRoomSwitcher ? 'Close' : 'Switch Room'}
+        </button>
+
+        <button
+          type="button"
+          onClick={onLeaveRoom}
+          aria-label="Leave stream room"
+          className="inline-flex items-center gap-1 text-xs sm:text-sm font-medium text-slate-500 hover:text-rose-600 transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900 rounded"
+        >
+          <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+          <span className="hidden sm:inline">Leave</span>
         </button>
       </nav>
 

@@ -89,7 +89,8 @@ export type ClientWsMessage =
   | { type: 'webrtc:offer'; targetId: string; offer: RTCSessionDescriptionInit }
   | { type: 'webrtc:answer'; targetId: string; answer: RTCSessionDescriptionInit }
   | { type: 'webrtc:ice-candidate'; targetId: string; candidate: RTCIceCandidateInit }
-  | { type: 'media:frame'; frame: string };
+  | { type: 'media:frame'; frame: string }
+  | { type: 'media:audio'; pcm16: string; sampleRate: number };
 
 /**
  * Strict discriminated union for Server -> Client WebSocket frames.
@@ -117,4 +118,5 @@ export type ServerWsMessage =
   | { type: 'webrtc:answer'; fromId: string; answer: RTCSessionDescriptionInit }
   | { type: 'webrtc:ice-candidate'; fromId: string; candidate: RTCIceCandidateInit }
   | { type: 'media:frame'; fromId: string; frame: string }
+  | { type: 'media:audio'; fromId: string; pcm16: string; sampleRate: number }
   | { type: 'error'; reason: string };

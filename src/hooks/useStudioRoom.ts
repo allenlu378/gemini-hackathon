@@ -12,6 +12,13 @@ import {
   shouldTriggerClipMark,
   validateDisplayName,
 } from '../utils/streamUtils';
+import {
+  base64ToFloat32,
+  computeRmsLevel,
+  downsampleFloat32ToInt16,
+  int16ToBase64,
+  RELAY_TARGET_SAMPLE_RATE,
+} from '../utils/audioRelay';
 import { ClipRingBuffer, dispatchClipToSink } from '../services/clipSink';
 import type {
   ClientWsMessage,
@@ -190,12 +197,16 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
   const [isAutoRecording, setIsAutoRecording] = useState(false);
   const [lastClipMarker, setLastClipMarker] = useState<ClipMarkerEvent | null>(null);
+  const [streamEndedNotice, setStreamEndedNotice] = useState<string | null>(null);
   const [participants, setParticipants] = useState<RoomParticipant[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
   const [directoryRooms, setDirectoryRooms] = useState<RoomSummary[]>([]);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [remoteRelayFrames, setRemoteRelayFrames] = useState<Record<string, string>>({});
+  const [mutedPeerIds, setMutedPeerIds] = useState<Record<string, boolean>>({});
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const [audioUnlockSeq, setAudioUnlockSeq] = useState(0);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
@@ -224,6 +235,11 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
   const localMediaPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
   const peersRef = useRef<Map<string, PeerRecord>>(new Map());
   const remoteStreamsMapRef = useRef<Map<string, MediaStream>>(new Map());
+  const mutedPeerIdsRef = useRef<Record<string, boolean>>({});
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const peerPlayCursorRef = useRef<Map<string, number>>(new Map());
+  const usingSyntheticAudioRef = useRef<boolean>(false);
+  const meterAudioCtxRef = useRef<AudioContext | null>(null);
   const autoRecorderRef = useRef<MediaRecorder | null>(null);
   const rollingBufferRef = useRef<ClipRingBuffer<Blob>>(new ClipRingBuffer<Blob>(60));
   const activeMimeTypeRef = useRef<string>('video/webm');
@@ -236,6 +252,109 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
 
   streamStartedAtRef.current = streamStartedAt;
   hasJoinedRef.current = hasJoined;
+  mutedPeerIdsRef.current = mutedPeerIds;
+
+  const ensurePlaybackContext = useCallback((): AudioContext | null => {
+    if (typeof window === 'undefined') return null;
+    if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return null;
+      try {
+        playbackCtxRef.current = new AudioCtx();
+      } catch {
+        return null;
+      }
+    }
+    return playbackCtxRef.current;
+  }, []);
+
+  const unlockAudio = useCallback(() => {
+    const ctx = ensurePlaybackContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx
+        .resume()
+        .then(() => {
+          setAudioBlocked(false);
+          setAudioUnlockSeq((s) => s + 1);
+        })
+        .catch(() => {
+          setAudioBlocked(true);
+        });
+    } else {
+      setAudioBlocked(false);
+      setAudioUnlockSeq((s) => s + 1);
+    }
+  }, [ensurePlaybackContext]);
+
+  const reportAudioBlocked = useCallback(() => {
+    setAudioBlocked(true);
+  }, []);
+
+  const togglePeerMute = useCallback((peerId: string) => {
+    setMutedPeerIds((prev) => {
+      const next = { ...prev, [peerId]: !prev[peerId] };
+      mutedPeerIdsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const playRelayedAudioChunk = useCallback(
+    (fromId: string, pcm16: string, sampleRate: number) => {
+      if (mutedPeerIdsRef.current[fromId]) return;
+      if (peersRef.current.get(fromId)?.pc.connectionState === 'connected') {
+        return;
+      }
+      const ctx = ensurePlaybackContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {
+          setAudioBlocked(true);
+        });
+        if (ctx.state === 'suspended') {
+          setAudioBlocked(true);
+          return;
+        }
+      }
+
+      const samples = base64ToFloat32(pcm16);
+      if (samples.length === 0) return;
+
+      try {
+        const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+        buffer.copyToChannel(samples, 0);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+
+        const now = ctx.currentTime;
+        let cursor = peerPlayCursorRef.current.get(fromId) ?? 0;
+        if (cursor < now + 0.015 || cursor > now + 0.55) {
+          cursor = now + 0.06;
+        }
+        source.start(cursor);
+        peerPlayCursorRef.current.set(fromId, cursor + buffer.duration);
+      } catch {
+        // ignore invalid audio frame
+      }
+    },
+    [ensurePlaybackContext]
+  );
+
+  // Automatically unlock suspended AudioContext / HTMLAudio on the next user click or keypress
+  useEffect(() => {
+    if (!audioBlocked) return;
+    const handleGesture = () => {
+      unlockAudio();
+    };
+    window.addEventListener('pointerdown', handleGesture, { once: true });
+    window.addEventListener('keydown', handleGesture, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', handleGesture);
+      window.removeEventListener('keydown', handleGesture);
+    };
+  }, [audioBlocked, unlockAudio]);
 
   const shuffleSelfAvatar = useCallback(() => {
     const next = pickRandomAnimalAvatar(avatarRef.current.url);
@@ -415,7 +534,7 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
         }
 
         let stream: MediaStream | null = null;
-        let isSynth = false;
+        let isSynthAudio = false;
 
         if (preferCamera && navigator.mediaDevices?.getUserMedia) {
           try {
@@ -428,17 +547,37 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
                 : { echoCancellation: true, noiseSuppression: true },
             });
             setUsingSyntheticFeed(false);
+            usingSyntheticAudioRef.current = false;
             setMediaNotice(null);
             await enumerateMediaDevices();
           } catch {
-            stream = null;
+            // Camera unavailable/blocked — try microphone-only so real voice still broadcasts!
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({
+                video: false,
+                audio: audioDeviceId
+                  ? { deviceId: { exact: audioDeviceId }, echoCancellation: true, noiseSuppression: true }
+                  : { echoCancellation: true, noiseSuppression: true },
+              });
+              videoEnabledRef.current = false;
+              setVideoEnabled(false);
+              setUsingSyntheticFeed(false);
+              usingSyntheticAudioRef.current = false;
+              setMediaNotice(
+                'No camera detected — joined with live microphone and your animal avatar.'
+              );
+              await enumerateMediaDevices();
+            } catch {
+              stream = null;
+            }
           }
         }
 
         if (!stream) {
           stream = createSyntheticStudioStream(profileRef.current.name);
-          isSynth = true;
+          isSynthAudio = true;
           setUsingSyntheticFeed(true);
+          usingSyntheticAudioRef.current = true;
           setMediaNotice(
             'No physical camera or microphone detected — previewing with Studio Camera Standby feed.'
           );
@@ -455,9 +594,15 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
         setLocalStream(stream);
         syncTracksToPeers(stream);
 
-        if (!isSynth && stream.getAudioTracks().length > 0) {
+        if (meterAudioCtxRef.current) {
+          meterAudioCtxRef.current.close().catch(() => {});
+          meterAudioCtxRef.current = null;
+        }
+
+        if (!isSynthAudio && stream.getAudioTracks().length > 0) {
           try {
             const actx = new AudioContext();
+            meterAudioCtxRef.current = actx;
             const src = actx.createMediaStreamSource(stream);
             const analyser = actx.createAnalyser();
             analyser.fftSize = 64;
@@ -540,9 +685,16 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
       peersRef.current.set(peerId, record);
 
       if (localStreamRef.current && profileRef.current.role !== 'viewer') {
-        localStreamRef.current.getTracks().forEach((track) => {
+        const tracks = localStreamRef.current.getTracks();
+        tracks.forEach((track) => {
           pc.addTrack(track, localStreamRef.current!);
         });
+        if (!tracks.some((t) => t.kind === 'video')) {
+          pc.addTransceiver('video', { direction: 'recvonly' });
+        }
+        if (!tracks.some((t) => t.kind === 'audio')) {
+          pc.addTransceiver('audio', { direction: 'recvonly' });
+        }
       } else {
         pc.addTransceiver('video', { direction: 'recvonly' });
         pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -603,6 +755,7 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
   const closeAllPeersRef = useRef(closeAllPeers);
   const startLocalMediaRef = useRef(startLocalMedia);
   const sendWsRef = useRef(sendWs);
+  const playRelayedAudioChunkRef = useRef(playRelayedAudioChunk);
 
   ensurePeerRecordRef.current = ensurePeerRecord;
   sendOfferToPeerRef.current = sendOfferToPeer;
@@ -610,6 +763,7 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
   closeAllPeersRef.current = closeAllPeers;
   startLocalMediaRef.current = startLocalMedia;
   sendWsRef.current = sendWs;
+  playRelayedAudioChunkRef.current = playRelayedAudioChunk;
 
   const joinRoom = useCallback(
     async (
@@ -619,6 +773,9 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     ) => {
       const nameCheck = validateDisplayName(profile.name);
       if (!nameCheck.ok) return;
+
+      // Unlock browser Web Audio playback inside the user's Join click gesture
+      unlockAudio();
 
       const cleanRoom = sanitizeRoomSlug(targetRoomId);
       const avatarUrl =
@@ -668,7 +825,7 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
 
       refreshDirectory();
     },
-    [closeAllPeers, refreshDirectory, selectedAudioId, selectedVideoId, sendWs, startLocalMedia]
+    [closeAllPeers, refreshDirectory, selectedAudioId, selectedVideoId, sendWs, startLocalMedia, unlockAudio]
   );
 
   // Automatic local rolling 60-second buffer while live (held in-memory for downstream ClipSinkAdapter)
@@ -927,14 +1084,26 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
               delete next[leftId];
               return next;
             });
+            peerPlayCursorRef.current.delete(leftId);
             setRemoteRelayFrames((prev) => {
               const next = { ...prev };
               delete next[leftId];
               return next;
             });
           } else if (msg.type === 'stream:status') {
+            const wasLive = streamStartedAtRef.current !== null;
+            const prevDuration = streamStartedAtRef.current
+              ? Math.max(0, Math.floor((Date.now() - streamStartedAtRef.current) / 1000))
+              : 0;
             setIsLive(msg.isLive);
             setStreamStartedAt(msg.streamStartedAt ?? null);
+            if (msg.isLive) {
+              setStreamEndedNotice(null);
+            } else if (wasLive) {
+              const mins = Math.floor(prevDuration / 60);
+              const secs = String(prevDuration % 60).padStart(2, '0');
+              setStreamEndedNotice(`Stream ended (${mins}:${secs}) — room is now offline.`);
+            }
             refreshDirectoryRef.current();
           } else if (msg.type === 'clip:marked') {
             const marker = msg.marker;
@@ -1015,6 +1184,8 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
             if (msg.fromId && msg.frame.startsWith('data:image/')) {
               setRemoteRelayFrames((prev) => ({ ...prev, [msg.fromId]: msg.frame }));
             }
+          } else if (msg.type === 'media:audio') {
+            playRelayedAudioChunkRef.current(msg.fromId, msg.pcm16, msg.sampleRate);
           }
         } catch {
           // ignore malformed signaling frames
@@ -1044,6 +1215,9 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
       if (clipBannerTimerRef.current) window.clearTimeout(clipBannerTimerRef.current);
       if (synthAnimRef.current) window.clearInterval(synthAnimRef.current);
       if (audioCtxRef.current) audioCtxRef.current.close().catch(() => {});
+      if (meterAudioCtxRef.current) meterAudioCtxRef.current.close().catch(() => {});
+      if (playbackCtxRef.current) playbackCtxRef.current.close().catch(() => {});
+      peerPlayCursorRef.current.clear();
       wsRef.current?.close();
       closeAllPeersRef.current();
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -1105,6 +1279,113 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     };
   }, [connected, hasJoined, localStream, participants, screenSharing, selfId, selfRole, usingSyntheticFeed, videoEnabled]);
 
+  // Automatic WebSocket PCM audio relay fallback whenever any peer's WebRTC P2P ICE is not connected
+  useEffect(() => {
+    if (
+      !hasJoined ||
+      !connected ||
+      selfRole === 'viewer' ||
+      !localStream ||
+      !audioEnabled ||
+      usingSyntheticAudioRef.current ||
+      localStream.getAudioTracks().length === 0
+    ) {
+      return;
+    }
+    const otherPeers = participants.filter((p) => p.id !== selfId);
+    if (otherPeers.length === 0) return;
+
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    let captureCtx: AudioContext | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let processor: ScriptProcessorNode | null = null;
+    let silentGain: GainNode | null = null;
+    let lastVoiceMs = 0;
+
+    try {
+      captureCtx = new AudioCtx();
+      if (captureCtx.state === 'suspended') {
+        captureCtx.resume().catch(() => {});
+      }
+      const audioOnlyStream = new MediaStream(localStream.getAudioTracks());
+      source = captureCtx.createMediaStreamSource(audioOnlyStream);
+      processor = captureCtx.createScriptProcessor(4096, 1, 1);
+      silentGain = captureCtx.createGain();
+      silentGain.gain.value = 0;
+
+      const inputSampleRate = captureCtx.sampleRate;
+      processor.onaudioprocess = (event) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 120_000) return;
+        const anyPeerNeedsRelay = otherPeers.some(
+          (p) => peersRef.current.get(p.id)?.pc.connectionState !== 'connected'
+        );
+        if (!anyPeerNeedsRelay) return;
+
+        const channelData = event.inputBuffer.getChannelData(0);
+        const rms = computeRmsLevel(channelData);
+        const now = Date.now();
+        if (rms > 0.002) {
+          lastVoiceMs = now;
+        }
+        if (now - lastVoiceMs > 700) {
+          return;
+        }
+
+        const pcm16 = downsampleFloat32ToInt16(
+          channelData,
+          inputSampleRate,
+          RELAY_TARGET_SAMPLE_RATE
+        );
+        if (pcm16.length === 0) return;
+        const audioMsg: ClientWsMessage = {
+          type: 'media:audio',
+          pcm16: int16ToBase64(pcm16),
+          sampleRate: RELAY_TARGET_SAMPLE_RATE,
+        };
+        ws.send(JSON.stringify(audioMsg));
+      };
+
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(captureCtx.destination);
+    } catch {
+      // ignore audio capture setup failure
+    }
+
+    return () => {
+      if (processor) {
+        processor.onaudioprocess = null;
+        try {
+          processor.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (source) {
+        try {
+          source.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (silentGain) {
+        try {
+          silentGain.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (captureCtx) {
+        captureCtx.close().catch(() => {});
+      }
+    };
+  }, [audioEnabled, connected, hasJoined, localStream, participants, selfId, selfRole]);
+
   const switchInputDevice = useCallback(
     async (audioId: string, videoId: string) => {
       setSelectedAudioId(audioId);
@@ -1130,13 +1411,18 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     setVideoEnabled((prev) => {
       const next = !prev;
       videoEnabledRef.current = next;
-      localStreamRef.current?.getVideoTracks().forEach((t) => {
-        t.enabled = next;
-      });
+      const tracks = localStreamRef.current?.getVideoTracks() || [];
+      if (next && tracks.length === 0 && profileRef.current.role !== 'viewer') {
+        void startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
+      } else {
+        tracks.forEach((t) => {
+          t.enabled = next;
+        });
+      }
       sendWs({ type: 'participant:media-state', videoEnabled: next });
       return next;
     });
-  }, [sendWs]);
+  }, [selectedAudioId, selectedVideoId, sendWs, startLocalMedia]);
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
@@ -1146,7 +1432,7 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
       return;
     }
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      setMediaNotice('Screen capture API is not available in this browser context.');
+      setMediaNotice('Screen sharing is not available in this browser context.');
       return;
     }
     try {
@@ -1159,25 +1445,80 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
       setLocalStream(screenStream);
       setScreenSharing(true);
       setUsingSyntheticFeed(false);
+      setMediaNotice(null);
       syncTracksToPeers(screenStream);
       sendWs({ type: 'participant:media-state', screenSharing: true });
       screenStream.getVideoTracks()[0].onended = () => {
         setScreenSharing(false);
         sendWs({ type: 'participant:media-state', screenSharing: false });
-        startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
+        void startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
       };
-    } catch {
-      // user cancelled share dialog
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : '';
+      if (name !== 'AbortError') {
+        setMediaNotice('Screen sharing was cancelled or blocked by browser permissions.');
+      }
     }
   }, [screenSharing, selectedAudioId, selectedVideoId, sendWs, startLocalMedia, syncTracksToPeers]);
 
   const toggleGoLive = useCallback(() => {
     if (selfRole === 'viewer') return;
+    unlockAudio();
     const next = !isLive;
-    setIsLive(next);
-    setStreamStartedAt(next ? Date.now() : null);
-    sendWs({ type: 'stream:toggle-live', isLive: next });
-  }, [isLive, selfRole, sendWs]);
+    if (next) {
+      setStreamEndedNotice(null);
+      setIsLive(true);
+      setStreamStartedAt(Date.now());
+      sendWs({ type: 'stream:toggle-live', isLive: true });
+    } else {
+      const durationSec = streamStartedAtRef.current
+        ? Math.max(0, Math.floor((Date.now() - streamStartedAtRef.current) / 1000))
+        : 0;
+      const mins = Math.floor(durationSec / 60);
+      const secs = String(durationSec % 60).padStart(2, '0');
+      setIsLive(false);
+      setStreamStartedAt(null);
+      setStreamEndedNotice(`Stream ended (${mins}:${secs}) — you are back in backstage preview.`);
+      sendWs({ type: 'stream:toggle-live', isLive: false });
+      if (screenSharing) {
+        setScreenSharing(false);
+        sendWs({ type: 'participant:media-state', screenSharing: false });
+        void startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
+      }
+    }
+  }, [isLive, screenSharing, selectedAudioId, selectedVideoId, selfRole, sendWs, startLocalMedia, unlockAudio]);
+
+  const leaveRoom = useCallback(() => {
+    if (isLive && selfRole !== 'viewer') {
+      const remainingBroadcasters = participants.filter(
+        (p) => p.id !== selfIdRef.current && p.role !== 'viewer'
+      );
+      if (remainingBroadcasters.length === 0) {
+        sendWs({ type: 'stream:toggle-live', isLive: false });
+      }
+    }
+    wsRef.current?.close();
+    wsRef.current = null;
+    closeAllPeers();
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
+    setLocalStream(null);
+    setConnected(false);
+    setIsLive(false);
+    setStreamStartedAt(null);
+    setScreenSharing(false);
+    setStreamEndedNotice(null);
+    setMediaNotice(null);
+    setLastClipMarker(null);
+    setParticipants([]);
+    setChatMessages([]);
+    hasJoinedRef.current = false;
+    setHasJoined(false);
+  }, [closeAllPeers, isLive, participants, selfRole, sendWs]);
+
+  const dismissStreamEndedNotice = useCallback(() => {
+    setStreamEndedNotice(null);
+  }, []);
 
   const updateRoomMeta = useCallback(
     (meta: { title?: string; category?: StreamCategory; slowModeSec?: number }) => {
@@ -1235,12 +1576,16 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     streamStartedAt,
     isAutoRecording,
     lastClipMarker,
+    streamEndedNotice,
     participants,
     chatMessages,
     chatError,
     directoryRooms,
     remoteStreams,
     remoteRelayFrames,
+    mutedPeerIds,
+    audioBlocked,
+    audioUnlockSeq,
     localStream,
     audioEnabled,
     videoEnabled,
@@ -1253,6 +1598,9 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     selectedAudioId,
     selectedVideoId,
     shuffleSelfAvatar,
+    togglePeerMute,
+    unlockAudio,
+    reportAudioBlocked,
     joinRoom,
     refreshDirectory,
     switchInputDevice,
@@ -1260,6 +1608,8 @@ export function useStudioRoom(initialRoomId = 'main-stage') {
     toggleVideo,
     toggleScreenShare,
     toggleGoLive,
+    leaveRoom,
+    dismissStreamEndedNotice,
     triggerClipMark,
     updateRoomMeta,
     sendChatMessage,

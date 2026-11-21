@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Pin, Send, Trash2, Users } from 'lucide-react';
 import {
   formatClockDuration,
+  getFallbackAnimalAvatar,
   partitionParticipants,
   QUICK_REACTIONS,
 } from '../utils/streamUtils';
@@ -157,7 +158,7 @@ export function LiveChatPanel({
                         </span>
                       </div>
 
-                      <div className="opacity-0 group-hover:opacity-100 focus-within:opacity-100 flex items-center gap-1 transition-opacity">
+                      <div className="opacity-70 lg:opacity-0 lg:group-hover:opacity-100 focus-within:opacity-100 flex items-center gap-1 transition-opacity">
                         <button
                           type="button"
                           onClick={() => onReactMessage(msg.id, 'W')}
@@ -238,8 +239,9 @@ export function LiveChatPanel({
               />
               <button
                 type="submit"
+                disabled={!draft.trim() || !connected}
                 aria-label="Send chat message"
-                className="p-2.5 bg-slate-950 hover:bg-slate-800 text-white rounded-xl transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900"
+                className="p-2.5 bg-slate-950 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900"
               >
                 <Send className="w-4 h-4" aria-hidden="true" />
               </button>
@@ -294,13 +296,20 @@ export function LiveChatPanel({
                   key={p.id}
                   className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl bg-slate-50 border border-slate-200/70"
                 >
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-slate-900 truncate">
-                      {p.name} {p.id === selfId ? '(You)' : ''}
-                    </p>
-                    <p className="text-xs text-slate-500 truncate">
-                      {p.handle} · <span className="capitalize">{p.role}</span>
-                    </p>
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <img
+                      src={p.avatarUrl || getFallbackAnimalAvatar(p.id).url}
+                      alt=""
+                      className="w-8 h-8 rounded-full object-cover ring-1 ring-slate-200 shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-slate-900 truncate">
+                        {p.name} {p.id === selfId ? '(You)' : ''}
+                      </p>
+                      <p className="text-xs text-slate-500 truncate">
+                        {p.handle} · <span className="capitalize">{p.role}</span>
+                      </p>
+                    </div>
                   </div>
                   <div className="text-xs text-slate-600 font-mono tabular-nums whitespace-nowrap">
                     {p.audioEnabled ? 'Mic On' : 'Muted'}
