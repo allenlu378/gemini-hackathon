@@ -1,0 +1,1270 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ANIMAL_AVATARS,
+  type AnimalAvatarOption,
+  appendChatUnique,
+  detectClipTriggerPhrase,
+  getFallbackAnimalAvatar,
+  isPolitePeer,
+  normalizeHandle,
+  pickRandomAnimalAvatar,
+  sanitizeRoomSlug,
+  shouldTriggerClipMark,
+  validateDisplayName,
+} from '../utils/streamUtils';
+import { ClipRingBuffer, dispatchClipToSink } from '../services/clipSink';
+import type {
+  ClientWsMessage,
+  RoomsListResponse,
+  ServerWsMessage,
+} from '../shared/protocol';
+import type {
+  ChatMessage,
+  ClipMarkerEvent,
+  ParticipantRole,
+  RoomParticipant,
+  RoomSummary,
+  StreamCategory,
+} from '../utils/types';
+
+export interface StudioProfile {
+  name: string;
+  handle: string;
+  role: ParticipantRole;
+  avatarUrl?: string;
+}
+
+export interface MediaDeviceOption {
+  deviceId: string;
+  label: string;
+}
+
+interface SpeechRecognitionResultLike {
+  0: { transcript: string };
+  isFinal: boolean;
+}
+
+interface SpeechRecognitionEventLike {
+  resultIndex: number;
+  results: ArrayLike<SpeechRecognitionResultLike>;
+}
+
+interface SpeechRecognitionInstance {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((ev: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((ev: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
+
+type SpeechRecognitionCtor = new () => SpeechRecognitionInstance;
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === 'undefined') return null;
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+}
+
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+};
+
+interface PeerRecord {
+  pc: RTCPeerConnection;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
+}
+
+function getOrCreateTabId(): string {
+  const key = 'clipthat_tab_id';
+  try {
+    const existing = window.sessionStorage.getItem(key);
+    if (existing && /^[a-zA-Z0-9_-]{6,48}$/.test(existing)) {
+      return existing;
+    }
+    const fresh = `user_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+    window.sessionStorage.setItem(key, fresh);
+    return fresh;
+  } catch {
+    return `user_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+function getOrCreateTabAnimalAvatar(): AnimalAvatarOption {
+  const key = 'clipthat_avatar_id';
+  try {
+    const existingId = window.sessionStorage.getItem(key);
+    if (existingId) {
+      const found = ANIMAL_AVATARS.find((a) => a.id === existingId);
+      if (found) return found;
+    }
+    const picked = pickRandomAnimalAvatar();
+    window.sessionStorage.setItem(key, picked.id);
+    return picked;
+  } catch {
+    return pickRandomAnimalAvatar();
+  }
+}
+
+function getInitialJoinContext(): {
+  autoJoined: boolean;
+  profile: StudioProfile;
+} {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const rawName = params.get('name') || '';
+    const rawRole = params.get('role')?.trim();
+    const autostart = params.get('autostart') === '1';
+    const role: ParticipantRole =
+      rawRole === 'viewer' || rawRole === 'cohost' || rawRole === 'host' ? rawRole : 'host';
+
+    const nameCheck = validateDisplayName(rawName);
+    if (nameCheck.ok) {
+      return {
+        autoJoined: true,
+        profile: {
+          name: nameCheck.name,
+          handle: normalizeHandle(nameCheck.name),
+          role,
+        },
+      };
+    }
+
+    if (autostart) {
+      return {
+        autoJoined: true,
+        profile: {
+          name: 'Studio Host',
+          handle: '@studiohost',
+          role,
+        },
+      };
+    }
+
+    return {
+      autoJoined: false,
+      profile: {
+        name: '',
+        handle: '',
+        role,
+      },
+    };
+  } catch {
+    return {
+      autoJoined: false,
+      profile: {
+        name: '',
+        handle: '',
+        role: 'host',
+      },
+    };
+  }
+}
+
+export function useStudioRoom(initialRoomId = 'main-stage') {
+  const initialContext = useRef(getInitialJoinContext());
+  const initialAvatar = useRef<AnimalAvatarOption>(getOrCreateTabAnimalAvatar());
+
+  const [hasJoined, setHasJoined] = useState<boolean>(initialContext.current.autoJoined);
+  const [selfAvatar, setSelfAvatar] = useState<AnimalAvatarOption>(initialAvatar.current);
+  const [roomId, setRoomId] = useState(() => sanitizeRoomSlug(initialRoomId));
+  const [roomTitle, setRoomTitle] = useState('Main Studio Stream');
+  const [roomCategory, setRoomCategory] = useState<StreamCategory>('Just Chatting');
+  const [slowModeSec, setSlowModeSec] = useState(0);
+  const [pinnedMessage, setPinnedMessage] = useState<ChatMessage | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [selfId, setSelfId] = useState<string | null>(() => getOrCreateTabId());
+  const [selfName, setSelfName] = useState<string>(initialContext.current.profile.name);
+  const [selfRole, setSelfRole] = useState<ParticipantRole>(initialContext.current.profile.role);
+  const [isLive, setIsLive] = useState(false);
+  const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [isAutoRecording, setIsAutoRecording] = useState(false);
+  const [lastClipMarker, setLastClipMarker] = useState<ClipMarkerEvent | null>(null);
+  const [participants, setParticipants] = useState<RoomParticipant[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [directoryRooms, setDirectoryRooms] = useState<RoomSummary[]>([]);
+  const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [remoteRelayFrames, setRemoteRelayFrames] = useState<Record<string, string>>({});
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [videoEnabled, setVideoEnabled] = useState(true);
+  const [screenSharing, setScreenSharing] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [usingSyntheticFeed, setUsingSyntheticFeed] = useState(false);
+  const [mediaNotice, setMediaNotice] = useState<string | null>(null);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceOption[]>([]);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceOption[]>([]);
+  const [selectedAudioId, setSelectedAudioId] = useState<string>('');
+  const [selectedVideoId, setSelectedVideoId] = useState<string>('');
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const hasJoinedRef = useRef<boolean>(initialContext.current.autoJoined);
+  const selfIdRef = useRef<string>(getOrCreateTabId());
+  const roomIdRef = useRef<string>(sanitizeRoomSlug(initialRoomId));
+  const avatarRef = useRef<AnimalAvatarOption>(initialAvatar.current);
+  const profileRef = useRef<StudioProfile>({
+    ...initialContext.current.profile,
+    avatarUrl: initialAvatar.current.url,
+  });
+  const audioEnabledRef = useRef<boolean>(true);
+  const videoEnabledRef = useRef<boolean>(true);
+  const streamStartedAtRef = useRef<number | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const localMediaPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
+  const peersRef = useRef<Map<string, PeerRecord>>(new Map());
+  const remoteStreamsMapRef = useRef<Map<string, MediaStream>>(new Map());
+  const autoRecorderRef = useRef<MediaRecorder | null>(null);
+  const rollingBufferRef = useRef<ClipRingBuffer<Blob>>(new ClipRingBuffer<Blob>(60));
+  const activeMimeTypeRef = useRef<string>('video/webm');
+  const lastClipMarkMsRef = useRef<number>(0);
+  const clipBannerTimerRef = useRef<number | null>(null);
+  const synthAnimRef = useRef<number | null>(null);
+  const synthCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const reconnectAttemptRef = useRef<number>(0);
+
+  streamStartedAtRef.current = streamStartedAt;
+  hasJoinedRef.current = hasJoined;
+
+  const shuffleSelfAvatar = useCallback(() => {
+    const next = pickRandomAnimalAvatar(avatarRef.current.url);
+    avatarRef.current = next;
+    profileRef.current.avatarUrl = next.url;
+    setSelfAvatar(next);
+    try {
+      window.sessionStorage.setItem('clipthat_avatar_id', next.id);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  const refreshDirectory = useCallback(async () => {
+    try {
+      const res = await fetch('/api/rooms');
+      if (res.ok) {
+        const data = (await res.json()) as RoomsListResponse;
+        setDirectoryRooms(data.rooms || []);
+      }
+    } catch {
+      // ignore transient poll failures
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshDirectory();
+    const timer = window.setInterval(refreshDirectory, 6000);
+    return () => window.clearInterval(timer);
+  }, [refreshDirectory]);
+
+  const enumerateMediaDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices
+        .filter((d) => d.kind === 'audioinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Microphone ${idx + 1}`,
+        }));
+      const cams = devices
+        .filter((d) => d.kind === 'videoinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Camera ${idx + 1}`,
+        }));
+      setAudioDevices(mics);
+      setVideoDevices(cams);
+    } catch {
+      // ignore device enumeration denial
+    }
+  }, []);
+
+  const createSyntheticStudioStream = useCallback((label: string): MediaStream => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = 720;
+    synthCanvasRef.current = canvas;
+    const ctx = canvas.getContext('2d');
+    let frame = 0;
+
+    const draw = () => {
+      if (ctx) {
+        frame += 1;
+        const grad = ctx.createLinearGradient(0, 0, 1280, 720);
+        grad.addColorStop(0, '#F8FAFC');
+        grad.addColorStop(1, '#EEF2F6');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 1280, 720);
+
+        ctx.strokeStyle = 'rgba(15, 23, 42, 0.05)';
+        ctx.lineWidth = 1;
+        for (let x = 0; x < 1280; x += 64) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, 720);
+          ctx.stroke();
+        }
+        for (let y = 0; y < 720; y += 64) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(1280, y);
+          ctx.stroke();
+        }
+
+        const barCount = 24;
+        const barW = 12;
+        const gap = 10;
+        const startX = (1280 - barCount * (barW + gap)) / 2;
+        for (let i = 0; i < barCount; i++) {
+          const amp = 20 + Math.abs(Math.sin(frame * 0.08 + i * 0.45)) * 84;
+          ctx.fillStyle = i % 4 === 0 ? '#E11D48' : '#0F172A';
+          ctx.beginPath();
+          ctx.roundRect(startX + i * (barW + gap), 375 - amp / 2, barW, amp, 6);
+          ctx.fill();
+        }
+
+        ctx.fillStyle = '#0F172A';
+        ctx.font = '600 32px "Plus Jakarta Sans", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, 640, 240);
+
+        ctx.fillStyle = '#64748B';
+        ctx.font = '500 18px "JetBrains Mono", monospace';
+        const sec = (frame / 15).toFixed(1);
+        ctx.fillText(`STUDIO CAMERA STANDBY · 1280x720 · ${sec}s`, 640, 495);
+      }
+    };
+
+    draw();
+    if (synthAnimRef.current) {
+      window.clearInterval(synthAnimRef.current);
+    }
+    synthAnimRef.current = window.setInterval(draw, 1000 / 15);
+
+    const stream = canvas.captureStream(15);
+
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const actx = new AudioCtx();
+      audioCtxRef.current = actx;
+      const dest = actx.createMediaStreamDestination();
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      gain.gain.value = 0.0001;
+      osc.connect(gain);
+      gain.connect(dest);
+      osc.start();
+      dest.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
+    } catch {
+      // fallback video-only synthetic stream
+    }
+
+    return stream;
+  }, []);
+
+  const syncTracksToPeers = useCallback((stream: MediaStream | null) => {
+    if (!stream) return;
+    peersRef.current.forEach(({ pc }) => {
+      const transceivers = pc.getTransceivers();
+      stream.getTracks().forEach((track) => {
+        const matchingTransceiver = transceivers.find(
+          (t) =>
+            t.sender.track?.kind === track.kind ||
+            t.receiver.track?.kind === track.kind
+        );
+        if (matchingTransceiver) {
+          if (matchingTransceiver.direction === 'recvonly') {
+            matchingTransceiver.direction = 'sendrecv';
+          }
+          matchingTransceiver.sender.replaceTrack(track).catch(() => {});
+        } else {
+          pc.addTrack(track, stream);
+        }
+      });
+    });
+  }, []);
+
+  const startLocalMedia = useCallback(
+    async (preferCamera = true, audioDeviceId?: string, videoDeviceId?: string) => {
+      const run = async (): Promise<MediaStream | null> => {
+        if (profileRef.current.role === 'viewer') {
+          if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((t) => t.stop());
+            localStreamRef.current = null;
+            setLocalStream(null);
+          }
+          setMediaNotice(null);
+          return null;
+        }
+
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((t) => t.stop());
+        }
+
+        let stream: MediaStream | null = null;
+        let isSynth = false;
+
+        if (preferCamera && navigator.mediaDevices?.getUserMedia) {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: videoDeviceId
+                ? { deviceId: { exact: videoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+                : { width: { ideal: 1280 }, height: { ideal: 720 } },
+              audio: audioDeviceId
+                ? { deviceId: { exact: audioDeviceId }, echoCancellation: true, noiseSuppression: true }
+                : { echoCancellation: true, noiseSuppression: true },
+            });
+            setUsingSyntheticFeed(false);
+            setMediaNotice(null);
+            await enumerateMediaDevices();
+          } catch {
+            stream = null;
+          }
+        }
+
+        if (!stream) {
+          stream = createSyntheticStudioStream(profileRef.current.name);
+          isSynth = true;
+          setUsingSyntheticFeed(true);
+          setMediaNotice(
+            'No physical camera or microphone detected — previewing with Studio Camera Standby feed.'
+          );
+        }
+
+        stream.getAudioTracks().forEach((t) => {
+          t.enabled = audioEnabledRef.current;
+        });
+        stream.getVideoTracks().forEach((t) => {
+          t.enabled = videoEnabledRef.current;
+        });
+
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+        syncTracksToPeers(stream);
+
+        if (!isSynth && stream.getAudioTracks().length > 0) {
+          try {
+            const actx = new AudioContext();
+            const src = actx.createMediaStreamSource(stream);
+            const analyser = actx.createAnalyser();
+            analyser.fftSize = 64;
+            src.connect(analyser);
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            const tick = () => {
+              if (localStreamRef.current !== stream) return;
+              analyser.getByteFrequencyData(data);
+              const avg = data.reduce((a, b) => a + b, 0) / data.length;
+              setAudioLevel(Math.min(100, Math.round((avg / 128) * 100)));
+              requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+          } catch {
+            setAudioLevel(24);
+          }
+        } else {
+          setAudioLevel(32);
+        }
+
+        return stream;
+      };
+
+      const promise = run();
+      localMediaPromiseRef.current = promise;
+      return promise;
+    },
+    [createSyntheticStudioStream, enumerateMediaDevices, syncTracksToPeers]
+  );
+
+  const sendWs = useCallback((payload: ClientWsMessage) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  }, []);
+
+  const closeAllPeers = useCallback(() => {
+    peersRef.current.forEach(({ pc }) => pc.close());
+    peersRef.current.clear();
+    remoteStreamsMapRef.current.clear();
+    setRemoteStreams({});
+    setRemoteRelayFrames({});
+  }, []);
+
+  const sendOfferToPeer = useCallback(
+    async (peerId: string, rec: PeerRecord) => {
+      if (rec.makingOffer || rec.pc.signalingState !== 'stable') return;
+      try {
+        rec.makingOffer = true;
+        await rec.pc.setLocalDescription();
+        if (rec.pc.localDescription) {
+          sendWs({
+            type: 'webrtc:offer',
+            targetId: peerId,
+            offer: rec.pc.localDescription.toJSON(),
+          });
+        }
+      } catch {
+        // Ignore negotiation glare; handled by Perfect Negotiation
+      } finally {
+        rec.makingOffer = false;
+      }
+    },
+    [sendWs]
+  );
+
+  const ensurePeerRecord = useCallback(
+    (peerId: string): PeerRecord => {
+      const existing = peersRef.current.get(peerId);
+      if (existing) return existing;
+
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+      const record: PeerRecord = {
+        pc,
+        makingOffer: false,
+        ignoreOffer: false,
+        pendingCandidates: [],
+      };
+      peersRef.current.set(peerId, record);
+
+      if (localStreamRef.current && profileRef.current.role !== 'viewer') {
+        localStreamRef.current.getTracks().forEach((track) => {
+          pc.addTrack(track, localStreamRef.current!);
+        });
+      } else {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      }
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          sendWs({
+            type: 'webrtc:ice-candidate',
+            targetId: peerId,
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+
+      pc.ontrack = (ev) => {
+        const track = ev.track;
+        let peerStream = remoteStreamsMapRef.current.get(peerId);
+        if (!peerStream) {
+          peerStream = new MediaStream();
+          remoteStreamsMapRef.current.set(peerId, peerStream);
+        }
+        if (!peerStream.getTracks().some((t) => t.id === track.id)) {
+          peerStream.addTrack(track);
+        }
+        const publishSnapshot = () => {
+          const current = remoteStreamsMapRef.current.get(peerId);
+          if (!current) return;
+          const snapshot = new MediaStream(current.getTracks());
+          setRemoteStreams((prev) => ({ ...prev, [peerId]: snapshot }));
+        };
+        publishSnapshot();
+        track.onunmute = publishSnapshot;
+      };
+
+      pc.onnegotiationneeded = async () => {
+        const polite = isPolitePeer(selfIdRef.current, peerId);
+        if (polite && !pc.currentRemoteDescription) {
+          return;
+        }
+        await sendOfferToPeer(peerId, record);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') {
+          pc.restartIce();
+        }
+      };
+
+      return record;
+    },
+    [sendOfferToPeer, sendWs]
+  );
+
+  const ensurePeerRecordRef = useRef(ensurePeerRecord);
+  const sendOfferToPeerRef = useRef(sendOfferToPeer);
+  const refreshDirectoryRef = useRef(refreshDirectory);
+  const closeAllPeersRef = useRef(closeAllPeers);
+  const startLocalMediaRef = useRef(startLocalMedia);
+  const sendWsRef = useRef(sendWs);
+
+  ensurePeerRecordRef.current = ensurePeerRecord;
+  sendOfferToPeerRef.current = sendOfferToPeer;
+  refreshDirectoryRef.current = refreshDirectory;
+  closeAllPeersRef.current = closeAllPeers;
+  startLocalMediaRef.current = startLocalMedia;
+  sendWsRef.current = sendWs;
+
+  const joinRoom = useCallback(
+    async (
+      targetRoomId: string,
+      profile: StudioProfile,
+      meta?: { title?: string; category?: StreamCategory }
+    ) => {
+      const nameCheck = validateDisplayName(profile.name);
+      if (!nameCheck.ok) return;
+
+      const cleanRoom = sanitizeRoomSlug(targetRoomId);
+      const avatarUrl =
+        profile.avatarUrl || avatarRef.current.url || getFallbackAnimalAvatar(selfIdRef.current).url;
+      const cleanProfile: StudioProfile = {
+        name: nameCheck.name,
+        handle: normalizeHandle(nameCheck.name, profile.handle),
+        role: profile.role,
+        avatarUrl,
+      };
+      profileRef.current = cleanProfile;
+      setSelfName(cleanProfile.name);
+      setSelfRole(cleanProfile.role);
+      roomIdRef.current = cleanRoom;
+      setRoomId(cleanRoom);
+
+      const url = new URL(window.location.href);
+      url.searchParams.set('room', cleanRoom);
+      window.history.replaceState({}, '', url.toString());
+
+      if (!hasJoinedRef.current) {
+        hasJoinedRef.current = true;
+        setHasJoined(true);
+        return;
+      }
+
+      closeAllPeers();
+      await startLocalMedia(
+        cleanProfile.role !== 'viewer',
+        selectedAudioId || undefined,
+        selectedVideoId || undefined
+      );
+
+      sendWs({
+        type: 'room:join',
+        roomId: cleanRoom,
+        participantId: selfIdRef.current,
+        name: cleanProfile.name,
+        handle: cleanProfile.handle,
+        role: cleanProfile.role,
+        title: meta?.title,
+        category: meta?.category,
+        audioEnabled: cleanProfile.role !== 'viewer' && audioEnabledRef.current,
+        videoEnabled: cleanProfile.role !== 'viewer' && videoEnabledRef.current,
+        avatarUrl,
+      });
+
+      refreshDirectory();
+    },
+    [closeAllPeers, refreshDirectory, selectedAudioId, selectedVideoId, sendWs, startLocalMedia]
+  );
+
+  // Automatic local rolling 60-second buffer while live (held in-memory for downstream ClipSinkAdapter)
+  useEffect(() => {
+    if (
+      !hasJoined ||
+      !isLive ||
+      selfRole === 'viewer' ||
+      !localStream ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      if (autoRecorderRef.current && autoRecorderRef.current.state !== 'inactive') {
+        try {
+          autoRecorderRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+      autoRecorderRef.current = null;
+      rollingBufferRef.current.clear();
+      setIsAutoRecording(false);
+      return;
+    }
+
+    const mimeCandidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    activeMimeTypeRef.current = mimeType || 'video/webm';
+
+    let recorder: MediaRecorder;
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(localStream, { mimeType })
+        : new MediaRecorder(localStream);
+    } catch {
+      setIsAutoRecording(false);
+      return;
+    }
+
+    rollingBufferRef.current.clear();
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        rollingBufferRef.current.push(ev.data);
+      }
+    };
+
+    try {
+      recorder.start(1000);
+      autoRecorderRef.current = recorder;
+      setIsAutoRecording(true);
+    } catch {
+      setIsAutoRecording(false);
+    }
+
+    return () => {
+      if (recorder.state !== 'inactive') {
+        try {
+          recorder.stop();
+        } catch {
+          // ignore
+        }
+      }
+      if (autoRecorderRef.current === recorder) {
+        autoRecorderRef.current = null;
+      }
+      rollingBufferRef.current.clear();
+      setIsAutoRecording(false);
+    };
+  }, [hasJoined, isLive, localStream, selfRole]);
+
+  const triggerClipMark = useCallback((source: 'manual' | 'voice' = 'manual') => {
+    if (profileRef.current.role === 'viewer') return;
+    const now = Date.now();
+    if (source === 'voice' && !shouldTriggerClipMark(lastClipMarkMsRef.current, now, 3500)) {
+      return;
+    }
+    lastClipMarkMsRef.current = now;
+    const streamTimeSec = streamStartedAtRef.current
+      ? Math.max(0, Math.round((now - streamStartedAtRef.current) / 1000))
+      : 0;
+    sendWsRef.current({ type: 'clip:mark', source, streamTimeSec });
+  }, []);
+
+  // Always-on automatic "clip that" voice detection while live and unmuted (no manual toggle needed)
+  useEffect(() => {
+    if (!hasJoined || !isLive || selfRole === 'viewer' || !audioEnabled) {
+      return;
+    }
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) return;
+
+    let active = true;
+    const recognition = new Ctor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const transcript = event.results[i]?.[0]?.transcript || '';
+        if (detectClipTriggerPhrase(transcript)) {
+          triggerClipMark('voice');
+        }
+      }
+    };
+
+    recognition.onerror = (ev) => {
+      if (
+        ev.error === 'not-allowed' ||
+        ev.error === 'service-not-allowed' ||
+        ev.error === 'audio-capture'
+      ) {
+        active = false;
+      }
+    };
+
+    recognition.onend = () => {
+      if (active) {
+        try {
+          recognition.start();
+        } catch {
+          // ignore restart race
+        }
+      }
+    };
+
+    try {
+      recognition.start();
+    } catch {
+      active = false;
+    }
+
+    return () => {
+      active = false;
+      recognition.onend = null;
+      try {
+        recognition.stop();
+      } catch {
+        // ignore
+      }
+    };
+  }, [audioEnabled, hasJoined, isLive, selfRole, triggerClipMark]);
+
+  // WebSocket signaling & media connection once user has entered their name and joined
+  useEffect(() => {
+    if (!hasJoined) return;
+
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+    let heartbeatTimer: number | null = null;
+
+    if (profileRef.current.role !== 'viewer') {
+      void startLocalMediaRef.current(true);
+    }
+
+    const connect = () => {
+      if (disposed) return;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+      wsRef.current = ws;
+
+      ws.onopen = async () => {
+        if (profileRef.current.role !== 'viewer' && localMediaPromiseRef.current) {
+          await localMediaPromiseRef.current.catch(() => null);
+        }
+        if (disposed || ws.readyState !== WebSocket.OPEN) return;
+
+        reconnectAttemptRef.current = 0;
+        setConnected(true);
+        const joinPayload: ClientWsMessage = {
+          type: 'room:join',
+          roomId: roomIdRef.current,
+          participantId: selfIdRef.current,
+          name: profileRef.current.name,
+          handle: profileRef.current.handle,
+          role: profileRef.current.role,
+          audioEnabled: profileRef.current.role !== 'viewer' && audioEnabledRef.current,
+          videoEnabled: profileRef.current.role !== 'viewer' && videoEnabledRef.current,
+          avatarUrl: profileRef.current.avatarUrl || avatarRef.current.url,
+        };
+        ws.send(JSON.stringify(joinPayload));
+
+        heartbeatTimer = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            const pingMsg: ClientWsMessage = { type: 'ping' };
+            ws.send(JSON.stringify(pingMsg));
+          }
+        }, 20000);
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as ServerWsMessage;
+
+          if (msg.type === 'pong') return;
+
+          if (msg.type === 'room:joined') {
+            const state = msg.state;
+            selfIdRef.current = msg.selfId;
+            setSelfId(msg.selfId);
+            setRoomTitle(state.title);
+            setRoomCategory(state.category);
+            setSlowModeSec(state.slowModeSec);
+            setPinnedMessage(state.pinnedMessage);
+            setIsLive(state.isLive);
+            setStreamStartedAt(state.streamStartedAt);
+            setParticipants(state.participants || []);
+            setChatMessages(state.chatHistory || []);
+            setRemoteRelayFrames({});
+
+            const selfMember = state.participants.find((p) => p.id === msg.selfId);
+            if (selfMember) {
+              setSelfRole(selfMember.role);
+              setSelfName(selfMember.name);
+              profileRef.current.role = selfMember.role;
+            }
+
+            for (const peer of state.participants) {
+              if (peer.id !== msg.selfId && !isPolitePeer(msg.selfId, peer.id)) {
+                const rec = ensurePeerRecordRef.current(peer.id);
+                if (rec.pc.signalingState === 'stable' && !rec.makingOffer && !rec.pc.localDescription) {
+                  await sendOfferToPeerRef.current(peer.id, rec);
+                }
+              }
+            }
+          } else if (msg.type === 'participant:joined') {
+            const incoming = msg.participant;
+            setParticipants((prev) =>
+              prev.some((p) => p.id === incoming.id)
+                ? prev.map((p) => (p.id === incoming.id ? incoming : p))
+                : [...prev, incoming]
+            );
+            if (incoming.id !== selfIdRef.current && !isPolitePeer(selfIdRef.current, incoming.id)) {
+              const rec = ensurePeerRecordRef.current(incoming.id);
+              if (rec.pc.signalingState === 'stable' && !rec.makingOffer && !rec.pc.localDescription) {
+                await sendOfferToPeerRef.current(incoming.id, rec);
+              }
+            }
+          } else if (msg.type === 'participant:updated') {
+            const updated = msg.participant;
+            setParticipants((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+          } else if (msg.type === 'participant:left') {
+            const leftId = msg.participantId;
+            setParticipants((prev) => prev.filter((p) => p.id !== leftId));
+            const rec = peersRef.current.get(leftId);
+            if (rec) {
+              rec.pc.close();
+              peersRef.current.delete(leftId);
+            }
+            remoteStreamsMapRef.current.delete(leftId);
+            setRemoteStreams((prev) => {
+              const next = { ...prev };
+              delete next[leftId];
+              return next;
+            });
+            setRemoteRelayFrames((prev) => {
+              const next = { ...prev };
+              delete next[leftId];
+              return next;
+            });
+          } else if (msg.type === 'stream:status') {
+            setIsLive(msg.isLive);
+            setStreamStartedAt(msg.streamStartedAt ?? null);
+            refreshDirectoryRef.current();
+          } else if (msg.type === 'clip:marked') {
+            const marker = msg.marker;
+            setLastClipMarker(marker);
+            if (profileRef.current.role !== 'viewer') {
+              const chunks = rollingBufferRef.current.snapshot();
+              void dispatchClipToSink({
+                marker,
+                mimeType: activeMimeTypeRef.current,
+                chunks,
+                bufferedSeconds: chunks.length,
+              });
+            }
+            if (clipBannerTimerRef.current) {
+              window.clearTimeout(clipBannerTimerRef.current);
+            }
+            clipBannerTimerRef.current = window.setTimeout(() => {
+              setLastClipMarker(null);
+            }, 6000);
+          } else if (msg.type === 'room:meta-updated') {
+            setRoomTitle(msg.title);
+            setRoomCategory(msg.category);
+            setSlowModeSec(msg.slowModeSec ?? 0);
+            refreshDirectoryRef.current();
+          } else if (msg.type === 'chat:message') {
+            setChatMessages((prev) => appendChatUnique(prev, msg.message));
+          } else if (msg.type === 'chat:updated') {
+            const updated = msg.message;
+            setChatMessages((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+          } else if (msg.type === 'chat:deleted') {
+            setChatMessages((prev) => prev.filter((m) => m.id !== msg.messageId));
+          } else if (msg.type === 'chat:pinned') {
+            setPinnedMessage(msg.pinnedMessage || null);
+          } else if (msg.type === 'chat:rejected') {
+            setChatError(msg.reason || 'Message rejected');
+            window.setTimeout(() => setChatError(null), 3500);
+          } else if (msg.type === 'webrtc:offer') {
+            const fromId = msg.fromId;
+            const rec = ensurePeerRecordRef.current(fromId);
+            const polite = isPolitePeer(selfIdRef.current, fromId);
+            const offerCollision = rec.makingOffer || rec.pc.signalingState !== 'stable';
+            rec.ignoreOffer = !polite && offerCollision;
+            if (rec.ignoreOffer) return;
+
+            await rec.pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
+            while (rec.pendingCandidates.length > 0) {
+              const cand = rec.pendingCandidates.shift()!;
+              await rec.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+            const answer = await rec.pc.createAnswer();
+            await rec.pc.setLocalDescription(answer);
+            if (rec.pc.localDescription) {
+              sendWsRef.current({
+                type: 'webrtc:answer',
+                targetId: fromId,
+                answer: rec.pc.localDescription.toJSON(),
+              });
+            }
+          } else if (msg.type === 'webrtc:answer') {
+            const rec = peersRef.current.get(msg.fromId);
+            if (rec && rec.pc.signalingState === 'have-local-offer') {
+              await rec.pc.setRemoteDescription(new RTCSessionDescription(msg.answer));
+              while (rec.pendingCandidates.length > 0) {
+                const cand = rec.pendingCandidates.shift()!;
+                await rec.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+              }
+            }
+          } else if (msg.type === 'webrtc:ice-candidate') {
+            const fromId = msg.fromId;
+            const rec = ensurePeerRecordRef.current(fromId);
+            if (rec.ignoreOffer) return;
+            if (rec.pc.remoteDescription) {
+              await rec.pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {});
+            } else {
+              rec.pendingCandidates.push(msg.candidate);
+            }
+          } else if (msg.type === 'media:frame') {
+            if (msg.fromId && msg.frame.startsWith('data:image/')) {
+              setRemoteRelayFrames((prev) => ({ ...prev, [msg.fromId]: msg.frame }));
+            }
+          }
+        } catch {
+          // ignore malformed signaling frames
+        }
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        if (heartbeatTimer) {
+          window.clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+        if (!disposed) {
+          const delay = Math.min(8000, 1000 * Math.pow(1.5, reconnectAttemptRef.current));
+          reconnectAttemptRef.current += 1;
+          reconnectTimer = window.setTimeout(connect, delay);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (heartbeatTimer) window.clearInterval(heartbeatTimer);
+      if (clipBannerTimerRef.current) window.clearTimeout(clipBannerTimerRef.current);
+      if (synthAnimRef.current) window.clearInterval(synthAnimRef.current);
+      if (audioCtxRef.current) audioCtxRef.current.close().catch(() => {});
+      wsRef.current?.close();
+      closeAllPeersRef.current();
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [hasJoined]);
+
+  // Automatic WebSocket media frame relay fallback when any peer's WebRTC P2P ICE connection is blocked/pending
+  useEffect(() => {
+    if (!hasJoined || !connected || selfRole === 'viewer' || !localStream || (!videoEnabled && !screenSharing)) {
+      return;
+    }
+    const otherPeers = participants.filter((p) => p.id !== selfId);
+    if (otherPeers.length === 0) return;
+
+    const offscreenVideo = document.createElement('video');
+    offscreenVideo.muted = true;
+    offscreenVideo.playsInline = true;
+    offscreenVideo.srcObject = localStream;
+    offscreenVideo.play().catch(() => {});
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 480;
+    canvas.height = 270;
+    const ctx = canvas.getContext('2d');
+
+    let timer: number | null = null;
+    const startupGraceTimer = window.setTimeout(() => {
+      timer = window.setInterval(() => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 180_000) return;
+
+        const anyPeerNeedsRelay = otherPeers.some(
+          (p) => peersRef.current.get(p.id)?.pc.connectionState !== 'connected'
+        );
+        if (!anyPeerNeedsRelay || !ctx) return;
+
+        if (offscreenVideo.readyState >= 2 && offscreenVideo.videoWidth > 0) {
+          ctx.drawImage(offscreenVideo, 0, 0, canvas.width, canvas.height);
+        } else if (usingSyntheticFeed && synthCanvasRef.current) {
+          ctx.drawImage(synthCanvasRef.current, 0, 0, canvas.width, canvas.height);
+        } else {
+          return;
+        }
+
+        let dataUrl = canvas.toDataURL('image/webp', 0.62);
+        if (!dataUrl.startsWith('data:image/webp')) {
+          dataUrl = canvas.toDataURL('image/jpeg', 0.62);
+        }
+        const frameMsg: ClientWsMessage = { type: 'media:frame', frame: dataUrl };
+        ws.send(JSON.stringify(frameMsg));
+      }, 130);
+    }, 600);
+
+    return () => {
+      window.clearTimeout(startupGraceTimer);
+      if (timer) window.clearInterval(timer);
+      offscreenVideo.pause();
+      offscreenVideo.srcObject = null;
+    };
+  }, [connected, hasJoined, localStream, participants, screenSharing, selfId, selfRole, usingSyntheticFeed, videoEnabled]);
+
+  const switchInputDevice = useCallback(
+    async (audioId: string, videoId: string) => {
+      setSelectedAudioId(audioId);
+      setSelectedVideoId(videoId);
+      await startLocalMedia(true, audioId || undefined, videoId || undefined);
+    },
+    [startLocalMedia]
+  );
+
+  const toggleAudio = useCallback(() => {
+    setAudioEnabled((prev) => {
+      const next = !prev;
+      audioEnabledRef.current = next;
+      localStreamRef.current?.getAudioTracks().forEach((t) => {
+        t.enabled = next;
+      });
+      sendWs({ type: 'participant:media-state', audioEnabled: next });
+      return next;
+    });
+  }, [sendWs]);
+
+  const toggleVideo = useCallback(() => {
+    setVideoEnabled((prev) => {
+      const next = !prev;
+      videoEnabledRef.current = next;
+      localStreamRef.current?.getVideoTracks().forEach((t) => {
+        t.enabled = next;
+      });
+      sendWs({ type: 'participant:media-state', videoEnabled: next });
+      return next;
+    });
+  }, [sendWs]);
+
+  const toggleScreenShare = useCallback(async () => {
+    if (screenSharing) {
+      setScreenSharing(false);
+      sendWs({ type: 'participant:media-state', screenSharing: false });
+      await startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setMediaNotice('Screen capture API is not available in this browser context.');
+      return;
+    }
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = screenStream;
+      setLocalStream(screenStream);
+      setScreenSharing(true);
+      setUsingSyntheticFeed(false);
+      syncTracksToPeers(screenStream);
+      sendWs({ type: 'participant:media-state', screenSharing: true });
+      screenStream.getVideoTracks()[0].onended = () => {
+        setScreenSharing(false);
+        sendWs({ type: 'participant:media-state', screenSharing: false });
+        startLocalMedia(true, selectedAudioId || undefined, selectedVideoId || undefined);
+      };
+    } catch {
+      // user cancelled share dialog
+    }
+  }, [screenSharing, selectedAudioId, selectedVideoId, sendWs, startLocalMedia, syncTracksToPeers]);
+
+  const toggleGoLive = useCallback(() => {
+    if (selfRole === 'viewer') return;
+    const next = !isLive;
+    setIsLive(next);
+    setStreamStartedAt(next ? Date.now() : null);
+    sendWs({ type: 'stream:toggle-live', isLive: next });
+  }, [isLive, selfRole, sendWs]);
+
+  const updateRoomMeta = useCallback(
+    (meta: { title?: string; category?: StreamCategory; slowModeSec?: number }) => {
+      sendWs({ type: 'room:update-meta', ...meta });
+    },
+    [sendWs]
+  );
+
+  const sendChatMessage = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      const streamTimeSec = streamStartedAt
+        ? Math.max(0, Math.round((Date.now() - streamStartedAt) / 1000))
+        : 0;
+      sendWs({ type: 'chat:send', text: trimmed, streamTimeSec });
+    },
+    [sendWs, streamStartedAt]
+  );
+
+  const reactToChatMessage = useCallback(
+    (messageId: string, label: string) => {
+      sendWs({ type: 'chat:react', messageId, label });
+    },
+    [sendWs]
+  );
+
+  const pinChatMessage = useCallback(
+    (messageId: string | null) => {
+      sendWs({ type: 'chat:pin', messageId });
+    },
+    [sendWs]
+  );
+
+  const deleteChatMessage = useCallback(
+    (messageId: string) => {
+      sendWs({ type: 'chat:delete', messageId });
+    },
+    [sendWs]
+  );
+
+  return {
+    hasJoined,
+    selfAvatar,
+    roomId,
+    roomTitle,
+    roomCategory,
+    slowModeSec,
+    pinnedMessage,
+    connected,
+    selfId,
+    selfName,
+    selfRole,
+    isLive,
+    streamStartedAt,
+    isAutoRecording,
+    lastClipMarker,
+    participants,
+    chatMessages,
+    chatError,
+    directoryRooms,
+    remoteStreams,
+    remoteRelayFrames,
+    localStream,
+    audioEnabled,
+    videoEnabled,
+    screenSharing,
+    audioLevel,
+    usingSyntheticFeed,
+    mediaNotice,
+    audioDevices,
+    videoDevices,
+    selectedAudioId,
+    selectedVideoId,
+    shuffleSelfAvatar,
+    joinRoom,
+    refreshDirectory,
+    switchInputDevice,
+    toggleAudio,
+    toggleVideo,
+    toggleScreenShare,
+    toggleGoLive,
+    triggerClipMark,
+    updateRoomMeta,
+    sendChatMessage,
+    reactToChatMessage,
+    pinChatMessage,
+    deleteChatMessage,
+  };
+}

@@ -1,0 +1,6 @@
+{
+  "name": "ClipCast Studio",
+  "description": "Multi-user Twitch-style live streaming platform with WebRTC audio/video rooms, synchronized stream recording, and real-time chat.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
